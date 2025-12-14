@@ -1,0 +1,841 @@
+import os
+import pandas as pd
+import numpy as np
+import tkinter as tk
+from tkinter import filedialog, ttk, messagebox
+from PIL import Image, ImageTk
+import pickle
+import torch
+import torch.nn as nn
+import torchvision.transforms as transforms
+import cv2
+from sklearn.preprocessing import StandardScaler
+from datetime import timedelta, datetime
+from collections import deque
+import sys
+
+if getattr (sys, "frozen", False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FOTOS_DIR = os.path.join(BASE_DIR, "FotosAgente")
+CSV_PATH = os.path.join(BASE_DIR, "CSVParaAgenteInteractivo.csv")
+MODEL_PATH = os.path.join(BASE_DIR, "AgenteSSmith.pth")
+SCALER_PATH = os.path.join(BASE_DIR, "EscaladorDeAgenteSSmith.pkl")
+IMAGEN_HUMANO = os.path.join(FOTOS_DIR, "Humano.png")
+RUTA_MODELO_VISION = os.path.join(BASE_DIR, "FotosIA", "ModeloCamara.pth")
+
+try:
+    RESAMPLE_FILTER = Image.Resampling.LANCZOS
+except AttributeError:
+    RESAMPLE_FILTER = Image.LANCZOS
+
+IMG_SIZE = 128 
+
+class GridCNN(nn.Module):
+    def __init__(self, num_clases=2):
+        super(GridCNN, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2)
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128 * 16 * 16, 512),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(512, num_clases)
+        )
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
+
+class DetectorGrid:
+    def __init__(self):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.modelo = None
+        self.transform = transforms.Compose([
+            transforms.Resize((IMG_SIZE, IMG_SIZE)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+        self.clases = ['Limpio', 'Polucion'] 
+
+    def cargar_modelo(self):
+        try:
+            if not os.path.exists(RUTA_MODELO_VISION):
+                print(f"No se encuentra el archivo: {RUTA_MODELO_VISION}")
+                return False
+                
+            self.modelo = GridCNN(num_clases=2)
+            self.modelo.load_state_dict(torch.load(RUTA_MODELO_VISION, map_location=self.device))
+            self.modelo.to(self.device)
+            self.modelo.eval()
+            return True
+        except Exception as e:
+            print(f"Error cargando modelo de vision: {e}")
+            return False
+
+    def analizar_frame(self, frame):
+        if self.modelo is None: return frame
+
+        alto_img, ancho_img, _ = frame.shape
+        tamano_cuadro = 128  
+        paso = 128           
+
+        patches = []
+        coords = []
+
+        for y in range(0, alto_img - tamano_cuadro + 1, paso):
+            for x in range(0, ancho_img - tamano_cuadro + 1, paso):
+                recorte = frame[y:y+tamano_cuadro, x:x+tamano_cuadro]
+                rgb_recorte = cv2.cvtColor(recorte, cv2.COLOR_BGR2RGB)
+                pil_img = Image.fromarray(rgb_recorte)
+                tensor = self.transform(pil_img)
+                patches.append(tensor)
+                coords.append((x, y))
+
+        if not patches: return frame
+
+        batch_tensors = torch.stack(patches).to(self.device)
+
+        with torch.no_grad():
+            outputs = self.modelo(batch_tensors)
+            probs = torch.nn.functional.softmax(outputs, dim=1)
+            confianzas, predicciones = torch.max(probs, 1)
+
+        contaminacion_detectada = False
+        predicciones_np = predicciones.cpu().numpy()
+        confianzas_np = confianzas.cpu().numpy()
+
+        for i in range(len(predicciones_np)):
+            clase_idx = predicciones_np[i]
+            conf = confianzas_np[i]
+            
+            if clase_idx == 1 and conf > 0.85: 
+                x, y = coords[i]
+                contaminacion_detectada = True
+                cv2.rectangle(frame, (x, y), (x + tamano_cuadro, y + tamano_cuadro), (0, 0, 255), 2)
+                cv2.putText(frame, f"{int(conf*100)}%", (x+5, y+15), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,0,255), 1)
+
+        if contaminacion_detectada:
+            cv2.rectangle(frame, (0,0), (ancho_img, alto_img), (0,0,255), 10)
+        else:
+            cv2.rectangle(frame, (0,0), (ancho_img, alto_img), (0,255,0), 10)
+
+        return frame
+
+EPP_NIVELES = {
+    0: [
+    ("Lentes de seguridad 3M.png", "Lentes de seguridad 3M", "uso a criterio de personal"),
+    ("Casco de Seguridad Anti-Impacto.png", "Casco de Seguridad Anti-Impacto", "uso a criterio de personal"),
+    ("Chaleco Geologo Fluor 360.png", "Chaleco Geologo Fluor 360", "uso a criterio de personal"),
+    ("Protector Auditivo Tipo Copa.png", "Protector Auditivo Tipo Copa", "uso a criterio de personal")
+],
+    1: [
+    ("Respirador Reutilizable de Media Cara 3M.png", "Respirador Reutilizable de Media Cara 3M", "uso opcional a criterio de personal"),
+    ("Buzo de Papel Bicolor.png", "Buzo de Papel Bicolor", "uso opcional a criterio de personal"),
+    ("Lentes de seguridad 3M.png", "Lentes de seguridad 3M", "uso opcional a criterio de personal"),
+    ("Casco de Seguridad Anti-Impacto.png", "Casco de Seguridad Anti-Impacto", "uso opcional a criterio de personal"),
+    ("Chaleco Geologo Fluor 360.png", "Chaleco Geologo Fluor 360", "uso opcional a criterio de personal"),
+    ("Protector Auditivo Tipo Copa.png", "Protector Auditivo Tipo Copa", "uso opcional a criterio de personal"),
+    ("Guantes Anti-Impacto-AntiCorte.png", "Guantes Anti-Impacto / AntiCorte", "uso segun trabajo"),
+    ("Guante de Seguridad Ansell Hyflex 11-801.png", "Guante Ansell Hyflex 11-801", "uso segun trabajo")
+],
+    2: [
+    ("Respirador Reutilizable de Media Cara 3M.png", "Respirador Reutilizable de Media Cara 3M", "uso estricto (ocasional desuso segun criterio)"),
+    ("Buzo de Papel Bicolor.png", "Buzo de Papel Bicolor", "uso estricto (ocasional desuso segun criterio)"),
+    ("Lentes de seguridad 3M.png", "Lentes de seguridad 3M", "uso estricto (ocasional desuso segun criterio)"),
+    ("Casco de Seguridad Anti-Impacto.png", "Casco de Seguridad Anti-Impacto", "uso estricto (ocasional desuso segun criterio)"),
+    ("Chaleco Geologo Fluor 360.png", "Chaleco Geologo Fluor 360", "uso estricto (ocasional desuso segun criterio)"),
+    ("Protector Auditivo Tipo Copa.png", "Protector Auditivo Tipo Copa", "uso estricto (ocasional desuso segun criterio)"),
+    ("Guantes Anti-Impacto-AntiCorte.png", "Guantes Anti-Impacto / AntiCorte", "uso segun trabajo"),
+    ("Guante de Seguridad Ansell Hyflex 11-801.png", "Guante Ansell Hyflex 11-801", "uso segun trabajo")
+],
+    3: [
+    ("Respirador Reutilizable de Media Cara 3M.png", "Respirador Reutilizable de Media Cara 3M", "uso estricto obligatorio"),
+    ("Buzo de Papel Bicolor.png", "Buzo de Papel Bicolor", "uso estricto obligatorio"),
+    ("Lentes de seguridad 3M.png", "Lentes de seguridad 3M", "uso estricto obligatorio"),
+    ("Casco de Seguridad Anti-Impacto.png", "Casco de Seguridad Anti-Impacto", "uso estricto obligatorio"),
+    ("Chaleco Geologo Fluor 360.png", "Chaleco Geologo Fluor 360", "uso estricto obligatorio"),
+    ("Protector Auditivo Tipo Copa.png", "Protector Auditivo Tipo Copa", "uso estricto obligatorio"),
+    ("Guantes Anti-Impacto-AntiCorte.png", "Guantes Anti-Impacto / AntiCorte", "uso segun trabajo"),
+    ("Guante de Seguridad Ansell Hyflex 11-801.png", "Guante Ansell Hyflex 11-801", "uso segun trabajo")
+    ],
+}
+
+EPP_CAL = [
+    ("Buzo Lakeland Chemax Anti-Acido Sellado.png", "Buzo Lakeland Chemax Anti-Acido Sellado", "uso obligatorio"),
+    ("Guantes Nitrilo.png", "Guantes Nitrilo", "uso obligatorio"),
+    ("Casco de Seguridad Anti-Impacto.png", "Casco de Seguridad Anti-Impacto", "uso obligatorio"),
+    ("Protector Auditivo Tipo Copa.png", "Protector Auditivo Tipo Copa", "uso obligatorio"),
+    ("Respirador de Seguridad 3M Rostro Completo serie 6000.png", "Respirador de Seguridad 3M Rostro Completo serie 6000", "uso obligatorio")
+]
+
+ICON_RATIO = {
+    "casco": 0.30,
+    "lentes": 0.2,
+    "respirador_media": 0.2,
+    "respirador_completo": 0.25,
+    "chaleco": 0.55,
+    "buzo": 1.3,
+    "buzo_chemax": 1.2,
+    "orejas": 0.25,
+    "guantes_anticorte": 0.18,
+    "guantes_hyflex": 0.18,
+    "guantes_nitrilo": 0.18,
+    "otros": 0.15
+}
+
+POSICIONES_EPP = {
+    "casco": (512, 150),
+    "lentes": (512, 230),
+    "respirador_media": (512, 310),
+    "respirador_completo": (512, 280),
+    "chaleco": (512, 580),
+    "buzo": (512, 700),
+    "buzo_chemax": (512, 720),
+    "orejas": (300, 220),
+    "guantes_anticorte": (280, 820),
+    "guantes_hyflex": (740, 820),
+    "guantes_nitrilo": (280, 820),
+    "otros": (512, 1300)
+}
+
+LABEL_OFFSETS = {
+    "guantes_anticorte": (-50, -20),
+    "guantes_hyflex": (0, -20),
+    "orejas": (-40, -40),
+    "guantes_nitrilo": (-200, -20),
+    "casco": (-20, -100),
+    "lentes": (0, -120),
+    "respirador_media": (25, -50),
+    "respirador_completo": (0, -70),
+    "chaleco": (-400, -50),
+    "buzo": (-250, -120),
+    "buzo_chemax": (-200, -80),
+    "otros": (0, 0)
+}
+
+current_epp_level = None
+_imagenes_originales = {}
+_epp_pos_key = {}
+_imagenes_cache_tam = {}
+
+def _detectar_pos_key_por_nombre(fname_lower):
+    if "chemax" in fname_lower: return "buzo_chemax"
+    if "media cara" in fname_lower or "media-cara" in fname_lower or "media_cara" in fname_lower: return "respirador_media"
+    if "rostro completo" in fname_lower or "rostro_completo" in fname_lower: return "respirador_completo"
+    if "casco" in fname_lower: return "casco"
+    if "lente" in fname_lower or "gafa" in fname_lower or "copas" in fname_lower: return "lentes"
+    if "chaleco" in fname_lower: return "chaleco"
+    if "buzo" in fname_lower: return "buzo"
+    if "nitril" in fname_lower or "nitrile" in fname_lower: return "guantes_nitrilo"
+    if "hyflex" in fname_lower: return "guantes_hyflex"
+    if "anticorte" in fname_lower or "anti-impacto" in fname_lower: return "guantes_anticorte"
+    if "auditiv" in fname_lower or "oreja" in fname_lower: return "orejas"
+    return "otros"
+
+class ToolTip:
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tipwindow = None
+        widget.bind("<Enter>", self.show_tip)
+        widget.bind("<Leave>", self.hide_tip)
+
+    def show_tip(self, event=None):
+        if self.tipwindow or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + 20
+        self.tipwindow = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(tw, text=self.text, background="#ffffe0", relief='solid', borderwidth=1, justify='left', wraplength=250)
+        label.pack()
+
+    def hide_tip(self, event=None):
+        if self.tipwindow:
+            self.tipwindow.destroy()
+        self.tipwindow = None
+
+class RedNeuronal(nn.Module):
+    def __init__(self, NeuronasDeInicio, NeuronasDeAprendizaje=128, NeuronasDeSalida=4, PorcentajeDeDesactivado=0.3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(NeuronasDeInicio, NeuronasDeAprendizaje),
+            nn.BatchNorm1d(NeuronasDeAprendizaje),
+            nn.ReLU(),
+            nn.Dropout(PorcentajeDeDesactivado),
+            nn.Linear(NeuronasDeAprendizaje, max(32, NeuronasDeAprendizaje//2)),
+            nn.ReLU(),
+            nn.Linear(max(32, NeuronasDeAprendizaje//2), NeuronasDeSalida)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+def cargar_datos():
+    df = pd.read_csv(CSV_PATH)
+    df['fecha_dt'] = pd.to_datetime(df['fecha_dt'], errors='coerce')
+    return df
+
+def preparar_variables(df):
+    df_copy = df.copy()
+    df_copy['NumeroDeHora'] = df_copy['fecha_dt'].dt.hour
+    df_copy['DiaDeLaSemana'] = df_copy['fecha_dt'].dt.weekday
+    df_copy['Mes'] = df_copy['fecha_dt'].dt.month
+    df_copy['DiaDelAno'] = df_copy['fecha_dt'].dt.dayofyear
+    df_copy['PreguntaBooleanaEsFinDeSemana'] = df_copy['DiaDeLaSemana'].isin([5,6]).astype(int)
+    df_copy['HoraCiclicaSeno'] = np.sin(2*np.pi*df_copy['NumeroDeHora']/24)
+    df_copy['HoraCiclicaCoseno'] = np.cos(2*np.pi*df_copy['NumeroDeHora']/24)
+    return df_copy
+
+def generar_lags(df, lapsos=(1,6,24)):
+    df = df.sort_values('fecha_dt').reset_index(drop=True)
+    df['PrimerLagPM10'] = df['pm10'].shift(1).bfill()
+    df['PrimerLagPM25'] = df['pm25'].shift(1).bfill()
+    for ventana in lapsos:
+        df[f'PM10Promedio_{ventana}h'] = df['pm10'].rolling(ventana, min_periods=1).mean()
+        df[f'PM10DesviacionEstandar_{ventana}h'] = df['pm10'].rolling(ventana, min_periods=1).std().fillna(0)
+        df[f'PM25Promedio_{ventana}h'] = df['pm25'].rolling(ventana, min_periods=1).mean()
+        df[f'PM25DesviacionEstandar_{ventana}h'] = df['pm25'].rolling(ventana, min_periods=1).std().fillna(0)
+    df['DiferenciaPM10'] = df['pm10'] - df['PrimerLagPM10']
+    df['DFRelativaPM10'] = df['DiferenciaPM10'] / (df['PrimerLagPM10'] + 1e-6)
+    df['DiferenciaPM25'] = df['pm25'] - df['PrimerLagPM25']
+    df['DFRelativaPM25'] = df['DiferenciaPM25'] / (df['PrimerLagPM25'] + 1e-6)
+    return df
+
+def AsignacionDeEPP(pm10, pm25):
+    if pm25 > 40: c25 = 3
+    elif pm25 > 20: c25 = 2
+    elif pm25 > 10: c25 = 1
+    else: c25 = 0
+    if pm10 > 150: c10 = 3
+    elif pm10 > 75: c10 = 2
+    elif pm10 > 37.5: c10 = 1
+    else: c10 = 0
+    return max(c10, c25)
+
+VariablesDeEntrenamiento = [
+    'pm10','pm25','temperatura','humedad',
+    'zonaFeeder','zonaMolienda','zonaFlotacion','zonaEspesamiento','zonaRemolienda',
+    'PrimerLagPM10','PrimerLagPM25',
+    'PM10Promedio_1h','PM10Promedio_6h','PM10Promedio_24h',
+    'PM10DesviacionEstandar_1h','PM10DesviacionEstandar_6h','PM10DesviacionEstandar_24h',
+    'PM25Promedio_1h','PM25Promedio_6h','PM25Promedio_24h',
+    'PM25DesviacionEstandar_1h','PM25DesviacionEstandar_6h','PM25DesviacionEstandar_24h',
+    'DiferenciaPM10','DFRelativaPM10','DiferenciaPM25','DFRelativaPM25',
+    'HoraCiclicaSeno','HoraCiclicaCoseno','NumeroDeHora','DiaDeLaSemana','Mes','PreguntaBooleanaEsFinDeSemana','DiaDelAno'
+]
+
+modelo_valido = False
+net = None
+EscX = None
+EscY = None
+ColumnasX = None
+ColumnasY = None
+
+try:
+    if os.path.exists(SCALER_PATH) and os.path.exists(MODEL_PATH):
+        with open(SCALER_PATH, 'rb') as f:
+            scalers = pickle.load(f)
+        EscX = scalers.get('EscaladorX')
+        EscY = scalers.get('EscaladorY')
+        ColumnasX = scalers.get('ColumnasX')
+        ColumnasY = scalers.get('ColumnasY')
+
+        sample_input = torch.randn(1, len(ColumnasX))
+        net = RedNeuronal(NeuronasDeInicio=sample_input.shape[1])
+        net.load_state_dict(torch.load(MODEL_PATH, map_location='cpu'))
+        net.eval()
+        modelo_valido = True
+        print("Modelo y escaladores cargados correctamente.")
+    else:
+        print("No se encontraron MODEL_PATH o SCALER_PATH .")
+except Exception as e:
+    print(f"Error cargando modelo/escaladores: {e}")
+
+def predecir_por_turno(zonas_seleccionadas, turno):
+    try:
+        df = cargar_datos()
+        df = preparar_variables(df)
+        df = generar_lags(df)
+    except Exception as e:
+        print(f"Error leyendo CSV: {e}")
+        return [], 0
+
+    predicciones_finales = []
+    epp_max_total = 0
+
+    if turno.lower() == 'diurno':
+        horas_turno = list(range(6, 18))
+    else:
+        horas_turno = list(range(18, 24)) + list(range(0, 6))
+
+    zonas_flags = {
+        'feeder': 'zonaFeeder',
+        'molienda': 'zonaMolienda',
+        'flotacion': 'zonaFlotacion',
+        'espesamiento': 'zonaEspesamiento',
+        'remolienda': 'zonaRemolienda',
+        'cal': None
+    }
+
+    for zona in zonas_seleccionadas:
+        df_z = df[df['zona'].str.lower() == zona.lower()] if 'zona' in df.columns else df.copy()
+        if df_z.empty:
+            df_z = df.copy()
+            if df_z.empty:
+                continue
+
+        ultima = df_z.iloc[-1].copy()
+        fecha_ultima = ultima['fecha_dt'] if pd.notnull(ultima.get('fecha_dt')) else datetime.now()
+
+        pm10_ultima = float(ultima.get('pm10', 0) or 0)
+        pm25_ultima = float(ultima.get('pm25', 0) or 0)
+        predicciones_finales.append({
+            'fecha_dt': fecha_ultima,
+            'zona': zona,
+            'pm10': pm10_ultima,
+            'pm25': pm25_ultima,
+            'EPP': AsignacionDeEPP(pm10_ultima, pm25_ultima),
+            'tipo': 'ultima_medicion'
+        })
+        epp_max_total = max(epp_max_total, predicciones_finales[-1]['EPP'])
+
+        ahora = fecha_ultima + timedelta(hours=1)
+        horas_generadas = 0
+        estado = ultima.copy()
+
+        for flag_col in ['zonaFeeder','zonaMolienda','zonaFlotacion','zonaEspesamiento','zonaRemolienda']:
+            estado[flag_col] = 0
+        key = zonas_flags.get(zona.lower(), None)
+        if key:
+            estado[key] = 1
+
+        while True:
+            X_list = []
+            for col in VariablesDeEntrenamiento:
+                val = estado.get(col, 0)
+                if pd.isna(val):
+                    val = 0
+                X_list.append(float(val))
+            X = np.array(X_list, dtype=float).reshape(1, -1)
+
+            if modelo_valido and net is not None and EscX is not None and EscY is not None:
+                try:
+                    X_scaled = EscX.transform(X)
+                    X_tensor = torch.tensor(X_scaled, dtype=torch.float32)
+                    with torch.no_grad():
+                        Y_pred = net(X_tensor).cpu().numpy()
+                    Y_pred_inv = EscY.inverse_transform(Y_pred)[0]
+                    pm10_pred, pm25_pred = float(Y_pred_inv[0]), float(Y_pred_inv[1])
+                except Exception as e:
+                    print(f"Error inferencia: {e}")
+                    pm10_pred = float(estado.get('pm10', 10)) + np.random.uniform(-5, 10)
+                    pm25_pred = float(estado.get('pm25', 5)) + np.random.uniform(-3, 6)
+            else:
+                pm10_pred = float(estado.get('pm10', 10)) + np.random.uniform(-5, 10)
+                pm25_pred = float(estado.get('pm25', 5)) + np.random.uniform(-3, 6)
+
+            if 'pm10_suave' not in estado:
+                estado['pm10_suave'] = pm10_pred
+                estado['pm25_suave'] = pm25_pred
+            else:
+                alpha = 0.4  
+                estado['pm10_suave'] = alpha * pm10_pred + (1 - alpha) * estado['pm10_suave']
+                estado['pm25_suave'] = alpha * pm25_pred + (1 - alpha) * estado['pm25_suave']
+
+            pm10_pred_suave = estado['pm10_suave']
+            pm25_pred_suave = estado['pm25_suave']
+
+            epp = AsignacionDeEPP(pm10_pred_suave, pm25_pred_suave)
+            tipo = 'predicha_turno' if ahora.hour in horas_turno else 'predicha_pre_turno'
+
+            predicciones_finales.append({
+                'fecha_dt': ahora,
+                'zona': zona,
+                'pm10': pm10_pred_suave,
+                'pm25': pm25_pred_suave,
+                'EPP': epp,
+                'tipo': tipo
+            })
+            epp_max_total = max(epp_max_total, epp)
+
+            for lag in range(3, 0, -1):
+                if f'Lag{lag}PM10' in estado:
+                    estado[f'Lag{lag}PM10'] = estado.get(f'Lag{lag-1}PM10', pm10_pred_suave)
+                    estado[f'Lag{lag}PM25'] = estado.get(f'Lag{lag-1}PM25', pm25_pred_suave)
+            estado['Lag1PM10'] = pm10_pred_suave
+            estado['Lag1PM25'] = pm25_pred_suave
+
+            estado['pm10'] = pm10_pred_suave
+            estado['pm25'] = pm25_pred_suave
+            estado['fecha_dt'] = ahora
+            estado['NumeroDeHora'] = ahora.hour
+            estado['HoraCiclicaSeno'] = np.sin(2 * np.pi * estado['NumeroDeHora'] / 24)
+            estado['HoraCiclicaCoseno'] = np.cos(2 * np.pi * estado['NumeroDeHora'] / 24)
+            estado['DiaDeLaSemana'] = ahora.weekday()
+            estado['PreguntaBooleanaEsFinDeSemana'] = int(estado['DiaDeLaSemana'] in [5, 6])
+            estado['Mes'] = ahora.month
+            estado['DiaDelAno'] = ahora.timetuple().tm_yday
+
+            ahora += timedelta(hours=1)
+            horas_generadas += 1
+
+            if tipo == 'predicha_turno' and ahora.hour not in horas_turno:
+                break
+            if horas_generadas > 48:
+                break
+
+    return predicciones_finales, epp_max_total
+
+root = tk.Tk()
+screen_width = root.winfo_screenwidth()
+screen_height = root.winfo_screenheight()
+root.geometry(f"{screen_width}x{screen_height}+0+0")
+root.title("Mining Protectron")
+
+frame_sup = ttk.Frame(root, padding="5")
+frame_sup.pack(side='top', fill='x')
+
+frame_main = ttk.Frame(root)
+frame_main.pack(side='top', fill='both', expand=True)
+
+ttk.Label(frame_sup, text="Seleccionar zonas:").grid(row=0, column=0, sticky='w')
+zonas = ['Feeder','Molienda','Flotacion','Espesamiento','Remolienda','CAL']
+checkboxes = []
+for i, z in enumerate(zonas):
+    var = tk.StringVar(value="")
+    chk = ttk.Checkbutton(frame_sup, text=z, variable=var, onvalue=z, offvalue="")
+    chk.grid(row=1, column=i, sticky='w')
+    checkboxes.append(var)
+
+ttk.Label(frame_sup, text="Seleccionar turno:").grid(row=2, column=0, sticky='w')
+turno = tk.StringVar(value="Diurno")
+ttk.Radiobutton(frame_sup, text="Diurno", variable=turno, value="Diurno").grid(row=3, column=0, sticky='w')
+ttk.Radiobutton(frame_sup, text="Nochera", variable=turno, value="Nochera").grid(row=3, column=1, sticky='w')
+
+frame_main.columnconfigure(0, weight=1)
+frame_main.columnconfigure(1, weight=1)
+frame_main.rowconfigure(0, weight=1)
+
+canvas = tk.Canvas(frame_main, bg="#eee")
+canvas.grid(row=0, column=0, sticky='nsew')
+canvas._imgs = []
+
+humano_tk = None
+humano_x = humano_y = humano_w = humano_h = 0
+humano_img = None
+
+if os.path.exists(IMAGEN_HUMANO):
+    try:
+        humano_img = Image.open(IMAGEN_HUMANO).convert("RGBA")
+    except Exception as e:
+        print(f"Error cargando imagen humano: {e}")
+        humano_img = None
+
+def dibujar_humano():
+    global humano_tk, humano_x, humano_y, humano_w, humano_h, humano_img
+    canvas.delete("humano")
+    ancho_canvas = canvas.winfo_width() if canvas.winfo_width() > 1 else 300
+    alto_canvas = canvas.winfo_height() if canvas.winfo_height() > 1 else 600
+
+    if humano_img is None:
+        canvas.create_rectangle(0, 0, ancho_canvas, alto_canvas, fill="#ddd", tags="humano")
+        humano_x, humano_y, humano_w, humano_h = 0, 0, ancho_canvas, alto_canvas
+        return
+
+    proporcion = min(ancho_canvas / humano_img.width, alto_canvas / humano_img.height)
+    humano_w = max(1, int(humano_img.width * proporcion))
+    humano_h = max(1, int(humano_img.height * proporcion))
+
+    try:
+        img_resized = humano_img.resize((humano_w, humano_h), resample=RESAMPLE_FILTER)
+        humano_tk = ImageTk.PhotoImage(img_resized)
+    except Exception as e:
+        print(f"Error resize/PhotoImage: {e}")
+        humano_tk = None
+
+    humano_x = (ancho_canvas - humano_w) // 2
+    humano_y = (alto_canvas - humano_h) // 2
+
+    if humano_tk:
+        canvas.create_image(humano_x, humano_y, image=humano_tk, anchor='nw', tags="humano")
+    else:
+        canvas.create_rectangle(humano_x, humano_y, humano_x + humano_w, humano_y + humano_h,
+                                fill="#ccc", tags="humano")
+    canvas.tag_raise("epp")
+
+root.after(100, dibujar_humano)
+canvas.bind("<Configure>", lambda e: dibujar_humano())
+
+text_output = tk.Text(frame_main, padx=10, pady=10)
+text_output.grid(row=0, column=1, sticky='nsew')
+
+_imagenes_cache_tam.clear()
+_imagenes_originales.clear()
+_epp_pos_key.clear()
+
+for nivel, lista in EPP_NIVELES.items():
+    for fname, desc, uso in lista:
+        ruta = os.path.join(FOTOS_DIR, fname)
+        if fname in _imagenes_originales:
+            continue
+        if not os.path.exists(ruta):
+            continue
+        try:
+            img_pil = Image.open(ruta).convert("RGBA")
+            _imagenes_originales[fname] = img_pil
+            pk = _detectar_pos_key_por_nombre(fname.lower())
+            _epp_pos_key[fname] = pk
+            print(f"Cargado {fname}")
+        except Exception as e:
+            print(f"Error cargando {ruta}: {e}")
+
+for fname, desc, uso in EPP_CAL:
+    ruta = os.path.join(FOTOS_DIR, fname)
+    if fname in _imagenes_originales or not os.path.exists(ruta):
+        continue
+    try:
+        img_pil = Image.open(ruta).convert("RGBA")
+        _imagenes_originales[fname] = img_pil
+        _epp_pos_key[fname] = _detectar_pos_key_por_nombre(fname.lower())
+        print(f"Cargado CAL {fname}")
+    except Exception as e:
+        print(f"Error cargando {ruta}: {e}")
+
+_labels_epp = []
+
+def limpiar_labels_epp():
+    for lbl in _labels_epp:
+        lbl.destroy()
+    _labels_epp.clear()
+
+def mostrar_epp_por_nivel(nivel_epp, lista_epp_cal=None):
+    canvas.delete("epp")
+    limpiar_labels_epp()
+
+    usados = lista_epp_cal if lista_epp_cal else EPP_NIVELES.get(nivel_epp, [])
+
+    if humano_img is None or humano_w <= 0 or humano_h <= 0:
+        return
+
+    PRIORIDAD_EPP = {
+        "buzo_chemax": 0,
+        "buzo": 1,
+        "chaleco": 2,
+        "guantes_anticorte": 5,
+        "guantes_hyflex": 5,
+        "guantes_nitrilo": 5,
+        "orejas": 6,
+        "respirador_media": 10,
+        "respirador_completo": 11,
+        "lentes": 12,
+        "casco": 13,
+        "otros": 0
+    }
+
+    usados_ordenados = sorted(
+        usados,
+        key=lambda e: PRIORIDAD_EPP.get(_epp_pos_key.get(e[0], "otros"), 0)
+    )
+
+    humano_orig_w = humano_img.width
+    humano_orig_h = humano_img.height
+
+    for fname, desc, uso in usados_ordenados:
+        pos_key = _epp_pos_key.get(fname)
+        if not pos_key:
+            fname_lower = fname.lower()
+            pos_key = _detectar_pos_key_por_nombre(fname_lower)
+            _epp_pos_key[fname] = pos_key
+
+        base_xy = POSICIONES_EPP.get(pos_key, POSICIONES_EPP.get("otros", (512, 1300)))
+        base_x, base_y = base_xy
+
+        x = humano_x + int(base_x / humano_orig_w * humano_w)
+        y = humano_y + int(base_y / humano_orig_h * humano_h)
+
+        ratio = ICON_RATIO.get(pos_key, ICON_RATIO.get("otros", 0.15))
+        desired_w = max(8, int(humano_w * ratio))
+
+        img_orig = _imagenes_originales.get(fname)
+        if img_orig:
+            orig_w, orig_h = img_orig.size
+            desired_h = max(8, int(desired_w * (orig_h / orig_w)))
+            size_key = (desired_w, desired_h)
+            photo = _imagenes_cache_tam.get((fname, size_key))
+            if not photo:
+                try:
+                    resized = img_orig.resize(size_key, resample=RESAMPLE_FILTER)
+                    photo = ImageTk.PhotoImage(resized)
+                    _imagenes_cache_tam[(fname, size_key)] = photo
+                except Exception as e:
+                    print(f"Error resize {fname}: {e}")
+                    photo = None
+        else:
+            photo = None
+
+        if photo:
+            canvas._imgs.append(photo)
+            canvas.create_image(x, y, image=photo, tags="epp", anchor='center')
+        else:
+            canvas.create_rectangle(x-15, y-15, x+15, y+15, fill="#aaa", tags="epp")
+
+        lbl = tk.Label(canvas, text=f"{desc}\n{uso}", background="#ffffe0",
+               relief='solid', borderwidth=1, justify='left',
+               wraplength=int(humano_w*0.12))
+        lbl.update_idletasks()
+
+        lbl_width = lbl.winfo_width()
+        lbl_height = lbl.winfo_height()
+
+        dx, dy = LABEL_OFFSETS.get(pos_key, (0, 0))
+
+        if pos_key in ["guantes_anticorte", "orejas", "casco"]:
+            lbl_x = x - int(desired_w/2) - 6 - lbl_width + dx
+        else:
+            lbl_x = x + int(desired_w/2) + 6 + dx
+
+        lbl_y = y - lbl_height // 2 + dy
+
+        canvas_w = canvas.winfo_width()
+        canvas_h = canvas.winfo_height()
+        lbl_px = min(max(0, lbl_x), max(0, canvas_w - lbl_width))
+        lbl_py = min(max(0, lbl_y), max(0, canvas_h - lbl_height))
+
+        lbl.place(x=lbl_px, y=lbl_py)
+        _labels_epp.append(lbl)
+
+    canvas.tag_raise("epp")
+
+def _on_canvas_configure(event=None):
+    dibujar_humano()
+    if current_epp_level is not None:
+        if isinstance(current_epp_level, tuple) and current_epp_level[0] == "cal":
+            mostrar_epp_por_nivel(0, lista_epp_cal=current_epp_level[1])
+        else:
+            mostrar_epp_por_nivel(current_epp_level)
+
+canvas.bind("<Configure>", _on_canvas_configure)
+
+def mostrar_resultados():
+    global current_epp_level
+    global btn_cal_epp
+    global nivel_max_normal
+
+    zonas_sel = [zona.get() for zona in checkboxes if zona.get() != ""]
+    turno_sel = turno.get()
+    if not zonas_sel:
+        messagebox.showwarning("Atencion", "Debe seleccionar al menos una zona.")
+        return
+
+    text_output.delete(1.0, tk.END)
+    text_output.insert(tk.END, f"Predicciones de PM10 y PM2.5 - Turno {turno_sel}\n\n")
+
+    zonas_normales = [z for z in zonas_sel if z.lower() != "cal"]
+    incluye_cal = "cal" in [z.lower() for z in zonas_sel]
+
+    niveles_recolectados = []
+    for z in zonas_normales:
+        preds, epp_max = predecir_por_turno([z], turno_sel)
+        niveles_recolectados.append(epp_max)
+
+        if preds:
+            ultima = next((p for p in preds if p.get('tipo') == 'ultima_medicion'), None)
+            if ultima:
+                text_output.insert(tk.END, f"Ultima medicion en zona {z}:\n")
+                text_output.insert(tk.END, f"{ultima['fecha_dt']} - PM10:{ultima['pm10']:.1f} PM2.5:{ultima['pm25']:.1f} EPP:{ultima['EPP']}\n\n")
+            for p in preds:
+                if p.get('tipo') in ['predicha_pre_turno', 'predicha_turno']:
+                    text_output.insert(tk.END, f"{p['fecha_dt']} - PM10:{p['pm10']:.1f} PM2.5:{p['pm25']:.1f} EPP:{p['EPP']}\n")
+            text_output.insert(tk.END, "\n")
+        else:
+            text_output.insert(tk.END, f"No hay predicciones (zona {z}).\n\n")
+
+    nivel_max_normal = max(niveles_recolectados) if niveles_recolectados else 0
+    text_output.insert(tk.END, f"EPP maximo zonas fuera de CAL: {nivel_max_normal}\n")
+
+    dibujar_humano()
+    mostrar_epp_por_nivel(nivel_max_normal)
+    current_epp_level = nivel_max_normal
+
+    if incluye_cal:
+        text_output.insert(tk.END, "Zona CAL: EPP obligatorio disponible via boton\n")
+
+        def toggle_epp_cal():
+            global current_epp_level
+            if isinstance(current_epp_level, tuple) and current_epp_level[0] == "cal":
+                current_epp_level = nivel_max_normal
+                mostrar_epp_por_nivel(nivel_max_normal)
+                btn_cal_epp.config(text="Mostrar EPP CAL")
+            else:
+                current_epp_level = ("cal", EPP_CAL)
+                mostrar_epp_por_nivel(0, lista_epp_cal=EPP_CAL)
+                btn_cal_epp.config(text="Mostrar EPP Maximo Zonas")
+
+        if 'btn_cal_epp' not in globals() or btn_cal_epp is None:
+            btn_cal_epp = tk.Button(canvas, text="Mostrar EPP CAL", command=toggle_epp_cal, bg="#ffcccc")
+        canvas_w = canvas.winfo_width()
+        canvas_h = canvas.winfo_height()
+        btn_cal_epp.place(x=canvas_w - 100, y=-0)
+
+def accion_verificar_visual():
+    detector = DetectorGrid()
+    if not detector.cargar_modelo():
+        messagebox.showerror("Error de IA", f"No se pudo cargar 'ModeloCamara.pth' en:\n{RUTA_MODELO_VISION}")
+        return
+
+    ruta = filedialog.askopenfilename(title="Seleccionar Video/Foto", 
+                                      filetypes=[("Media", "*.jpg *.png *.mp4 *.avi *.mov")])
+    if not ruta: return
+    
+    es_video = ruta.lower().endswith(('.mp4', '.avi', '.mov'))
+    cap = cv2.VideoCapture(ruta)
+    
+    MAX_ANCHO_PANTALLA = 1000
+    MAX_ALTO_PANTALLA = 700 
+    NOMBRE_VENTANA = "Verificacion Visual IA"
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            if es_video: break 
+            else: 
+                cv2.waitKey(0) 
+                break
+        
+        alto_orig, ancho_orig = frame.shape[:2]
+        escala_ancho = MAX_ANCHO_PANTALLA / ancho_orig
+        escala_alto = MAX_ALTO_PANTALLA / alto_orig
+        escala = min(escala_ancho, escala_alto)
+
+        nuevo_ancho = int(ancho_orig * escala)
+        nuevo_alto = int(alto_orig * escala)
+
+        frame_resized = cv2.resize(frame, (nuevo_ancho, nuevo_alto))
+        frame_procesado = detector.analizar_frame(frame_resized)
+
+        cv2.imshow(NOMBRE_VENTANA, frame_procesado)
+
+        wait = 1 if es_video else 0
+        if cv2.waitKey(wait) & 0xFF == ord('q'):
+            break
+        try:
+            if cv2.getWindowProperty(NOMBRE_VENTANA, cv2.WND_PROP_VISIBLE) < 1:
+                break
+        except:
+            pass
+    
+    cap.release()
+    cv2.destroyAllWindows()
+
+ttk.Button(frame_sup, text="Generar predicciones", command=mostrar_resultados).grid(row=4, column=0, pady=10, sticky='w')
+ttk.Button(frame_sup, text="Verificar medicion de polucion", command=accion_verificar_visual).grid(row=4, column=1, pady=10, sticky='w')
+
+root.mainloop()
