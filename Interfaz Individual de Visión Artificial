@@ -1,0 +1,162 @@
+import torch
+import torch.nn as nn
+import torchvision.transforms as transforms
+from PIL import Image
+import cv2
+import os
+import tkinter as tk
+from tkinter import filedialog
+import numpy as np
+
+IMG_SIZE = 128 
+
+class GridCNN(nn.Module):
+    def __init__(self, num_clases=2):
+        super(GridCNN, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2)
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128 * 16 * 16, 512),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(512, num_clases)
+        )
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
+
+class DetectorGrid:
+    def __init__(self):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.modelo = None
+        self.transform = transforms.Compose([
+            transforms.Resize((IMG_SIZE, IMG_SIZE)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+        self.clases = ['Limpio', 'Polucion'] 
+
+    def cargar_modelo(self):
+        ruta = os.path.join(os.path.expanduser("~"), "Desktop", "FotosIA", "ModeloCamara.pth")
+        try:
+            self.modelo = GridCNN(num_clases=2)
+            self.modelo.load_state_dict(torch.load(ruta, map_location=self.device))
+            self.modelo.to(self.device)
+            self.modelo.eval()
+            print("Modelo Grid cargado correctamente.")
+            return True
+        except Exception as e:
+            print(f"Error cargando modelo: {e}")
+            return False
+
+    def analizar_frame(self, frame):
+        if self.modelo is None: return frame
+
+        alto_img, ancho_img, _ = frame.shape
+        
+        tamano_cuadro = 128  
+        paso = 128           
+
+        patches = []
+        coords = []
+
+        for y in range(0, alto_img - tamano_cuadro + 1, paso):
+            for x in range(0, ancho_img - tamano_cuadro + 1, paso):
+                recorte = frame[y:y+tamano_cuadro, x:x+tamano_cuadro]
+                
+                rgb_recorte = cv2.cvtColor(recorte, cv2.COLOR_BGR2RGB)
+                pil_img = Image.fromarray(rgb_recorte)
+                tensor = self.transform(pil_img)
+                
+                patches.append(tensor)
+                coords.append((x, y))
+
+        if not patches: return frame
+
+        batch_tensors = torch.stack(patches).to(self.device)
+
+        with torch.no_grad():
+            outputs = self.modelo(batch_tensors)
+            probs = torch.nn.functional.softmax(outputs, dim=1)
+            confianzas, predicciones = torch.max(probs, 1)
+
+        contaminacion_detectada = False
+        
+        predicciones_np = predicciones.cpu().numpy()
+        confianzas_np = confianzas.cpu().numpy()
+
+        for i in range(len(predicciones_np)):
+            clase_idx = predicciones_np[i]
+            conf = confianzas_np[i]
+            
+            # ASUMIENDO QUE 1 ES POLUCION (Revisa el print de clases en el entrenamiento)
+            if clase_idx == 1 and conf > 0.85: # Umbral de confianza 85%
+                x, y = coords[i]
+                contaminacion_detectada = True
+                
+                cv2.rectangle(frame, (x, y), (x + tamano_cuadro, y + tamano_cuadro), (0, 0, 255), 2)
+                
+                cv2.putText(frame, f"{int(conf*100)}%", (x+5, y+15), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,0,255), 1)
+
+        if contaminacion_detectada:
+            cv2.rectangle(frame, (0,0), (ancho_img, alto_img), (0,0,255), 10)
+        else:
+            cv2.rectangle(frame, (0,0), (ancho_img, alto_img), (0,255,0), 10)
+
+        return frame
+
+def main():
+    detector = DetectorGrid()
+    if not detector.cargar_modelo():
+        print("No se pudo iniciar sin el modelo.")
+        return
+
+    root = tk.Tk()
+    root.title("Panel de Control")
+    root.geometry("300x100")
+
+    def abrir_archivo():
+        ruta = filedialog.askopenfilename(filetypes=[("Media", "*.jpg *.png *.mp4 *.avi")])
+        if not ruta: return
+        
+        es_video = ruta.lower().endswith(('.mp4', '.avi', '.mov'))
+        cap = cv2.VideoCapture(ruta)
+        
+        ANCHO_VISUALIZACION = 800 
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                if es_video: break 
+                else: 
+                    cv2.waitKey(0) 
+                    break
+            
+            factor = ANCHO_VISUALIZACION / frame.shape[1]
+            nuevo_alto = int(frame.shape[0] * factor)
+            frame_resized = cv2.resize(frame, (ANCHO_VISUALIZACION, nuevo_alto))
+
+            frame_procesado = detector.analizar_frame(frame_resized)
+
+            cv2.imshow("Detector de Polucion por Grid", frame_procesado)
+
+            wait = 1 if es_video else 0
+            if cv2.waitKey(wait) & 0xFF == ord('q'):
+                break
+        
+        cap.release()
+        cv2.destroyAllWindows()
+
+    btn = tk.Button(root, text="Cargar Foto/Video", command=abrir_archivo, height=2, width=20)
+    btn.pack(pady=20)
+
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
